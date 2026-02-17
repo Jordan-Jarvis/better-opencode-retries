@@ -1,0 +1,22 @@
+{
+  "name": "better-opencode-retries",
+  "version": "0.1.0",
+  "description": "OpenCode plugin that auto-recovers from transient stream/network errors by retrying/continuing with backoff.",
+  "license": "MIT",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.js"
+  },
+  "files": [
+    "src/",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
+
