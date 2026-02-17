@@ -73,6 +73,71 @@ export const BetterOpencodeRetries = async (ctx = {}) => {
     return cfg;
   };
 
+  const getMarkersForProvider = (providerId) => {
+    const cfg = providerId ? getConfigForProvider(providerId) : globalCfg;
+    const markers = new Set([
+      DEFAULT_CONFIG.marker,
+      globalCfg.marker,
+      cfg?.marker,
+      // Back-compat with earlier prototype plugin marker
+      "[auto-retry",
+    ]);
+    return Array.from(markers).filter((m) => typeof m === "string" && m.trim().length > 0);
+  };
+
+  const isAutoRetryPrompt = (text, providerId) => {
+    if (!text) return false;
+    const markers = getMarkersForProvider(providerId);
+    return markers.some((m) => text.startsWith(m));
+  };
+
+  const getSessionMessages = async (sessionID, limit = 50) => {
+    try {
+      const res = await ctx?.client?.session?.messages?.({
+        path: { id: sessionID },
+        query: { limit },
+      });
+      const data = res && typeof res === "object" && "data" in res ? res.data : res;
+      return Array.isArray(data) ? data : undefined;
+    } catch {
+      return undefined;
+    }
+  };
+
+  const hydrateLastUserFromServer = async (sessionID) => {
+    const messages = await getSessionMessages(sessionID, 50);
+    if (!messages) return undefined;
+
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const item = messages[i];
+      const info = item?.info;
+      if (!info || info.role !== "user") continue;
+
+      const providerId = info?.model?.providerID;
+      const parts = Array.isArray(item?.parts) ? item.parts : [];
+      const text = parts
+        .filter((p) => p && p.type === "text" && typeof p.text === "string")
+        .map((p) => p.text)
+        .join("\n")
+        .trim();
+
+      // Don't let our own auto-retry prompts overwrite last-user state.
+      if (isAutoRetryPrompt(text, providerId)) continue;
+
+      const existing = lastUser.get(sessionID);
+      lastUser.set(sessionID, {
+        agent: info.agent ?? existing?.agent,
+        model: info.model ?? existing?.model,
+        variant: existing?.variant,
+        text: text ?? existing?.text ?? "",
+      });
+
+      return lastUser.get(sessionID);
+    }
+
+    return undefined;
+  };
+
   const scheduleContinue = async ({ sessionID, providerID, label, message }) => {
     const cfg = getConfigForProvider(providerID);
     if (!shouldHandleProvider(providerID, cfg)) return;
@@ -206,6 +271,9 @@ export const BetterOpencodeRetries = async (ctx = {}) => {
     "chat.message": async (input, output) => {
       try {
         if (!input?.sessionID) return;
+        const info = output?.message;
+        const providerId = info?.model?.providerID;
+
         const parts = Array.isArray(output?.parts) ? output.parts : [];
         const text = parts
           .filter((p) => p && p.type === "text" && typeof p.text === "string")
@@ -213,17 +281,15 @@ export const BetterOpencodeRetries = async (ctx = {}) => {
           .join("\n")
           .trim();
 
-        if (!text) return;
-
         // Ignore our own auto-retry prompts.
-        const marker = globalCfg.marker || DEFAULT_CONFIG.marker;
-        if (text.startsWith(marker)) return;
+        if (isAutoRetryPrompt(text, providerId)) return;
 
         lastUser.set(input.sessionID, {
-          agent: input.agent,
-          model: input.model,
+          // Prefer the stored message info because it always includes a resolved model.
+          agent: info?.agent ?? input.agent,
+          model: info?.model ?? input.model,
           variant: input.variant,
-          text,
+          text: text ?? "",
         });
       } catch {}
     },
@@ -240,8 +306,14 @@ export const BetterOpencodeRetries = async (ctx = {}) => {
         if (!msg) return;
 
         // Best-effort providerID from last user message.
-        const last = lastUser.get(sessionID);
-        const providerID = last?.model?.providerID;
+        let last = lastUser.get(sessionID);
+        let providerID = last?.model?.providerID;
+
+        // If we don't have last-user context (or it lacks model info), fetch it from the server.
+        if (!providerID) {
+          last = (await hydrateLastUserFromServer(sessionID)) ?? last;
+          providerID = last?.model?.providerID;
+        }
         if (!providerID) return;
 
         const cfg = getConfigForProvider(providerID);
