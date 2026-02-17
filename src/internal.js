@@ -17,6 +17,7 @@ const DEFAULT_RETRYABLE_PATTERNS = [
   // Undici / fetch / socket-ish messages
   { re: /\bUND_ERR_(CONNECT_TIMEOUT|HEADERS_TIMEOUT|BODY_TIMEOUT|SOCKET)\b/i, label: "Network/stream error" },
   { re: /\bECONNRESET\b/i, label: "Connection reset" },
+  { re: /connection reset by peer/i, label: "Connection reset by peer" },
   { re: /\bECONNREFUSED\b/i, label: "Connection refused" },
   { re: /\bEPIPE\b/i, label: "Broken pipe" },
   { re: /\bETIMEDOUT\b/i, label: "Timed out" },

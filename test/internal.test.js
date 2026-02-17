@@ -17,6 +17,12 @@ test("matchRetryable: matches HTTP/2 INTERNAL_ERROR received from peer", () => {
   assert.equal(label, "HTTP/2 stream internal error");
 });
 
+test("matchRetryable: matches connection reset by peer", () => {
+  const msg = "read tcp 172.19.0.2:51808->104.18.32.47:443: read: connection reset by peer";
+  const label = matchRetryable(msg, DEFAULT_CONFIG);
+  assert.equal(label, "Connection reset by peer");
+});
+
 test("matchRetryable: does not match AbortError/user aborts", () => {
   const msg = "AbortError: The operation was aborted";
   const label = matchRetryable(msg, DEFAULT_CONFIG);
