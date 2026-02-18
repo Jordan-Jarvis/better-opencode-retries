@@ -7,8 +7,8 @@ import {
   mergeConfig,
   computeDelayMs,
   matchRetryable,
+  matchRetryableStructured,
   shouldHandleProvider,
-  buildAutoContinueText,
 } from "../src/internal.js";
 
 test("matchRetryable: matches HTTP/2 INTERNAL_ERROR received from peer", () => {
@@ -21,6 +21,27 @@ test("matchRetryable: matches connection reset by peer", () => {
   const msg = "read tcp 172.19.0.2:51808->104.18.32.47:443: read: connection reset by peer";
   const label = matchRetryable(msg, DEFAULT_CONFIG);
   assert.equal(label, "Connection reset by peer");
+});
+
+test("matchRetryableStructured: retries on any error when status not excluded", () => {
+  const cfg = mergeConfig(DEFAULT_CONFIG, { retryOnAnyError: true });
+  const err = { name: "SomeError", data: { message: "bad gateway", status: 502 } };
+  const label = matchRetryableStructured(err, cfg);
+  assert.equal(label, "HTTP status 502");
+});
+
+test("matchRetryableStructured: does not retry excluded HTTP status", () => {
+  const cfg = mergeConfig(DEFAULT_CONFIG, { retryOnAnyError: true });
+  const err = { name: "AuthError", data: { message: "unauthorized", status: 401 } };
+  const label = matchRetryableStructured(err, cfg);
+  assert.equal(label, undefined);
+});
+
+test("matchRetryableStructured: retries HTTP 422 by default", () => {
+  const cfg = mergeConfig(DEFAULT_CONFIG, { retryOnAnyError: true });
+  const err = { name: "UnprocessableEntity", data: { message: "unprocessable", status: 422 } };
+  const label = matchRetryableStructured(err, cfg);
+  assert.equal(label, "HTTP status 422");
 });
 
 test("matchRetryable: does not match AbortError/user aborts", () => {
@@ -44,9 +65,6 @@ test("normalizeConfig: clamps/normalizes inputs", () => {
     maxDelayMs: 250,
     includeProviders: ["cli", "  ", 123],
     excludeProviders: ["openai"],
-    marker: " [x] ",
-    includeLastUserExcerpt: "true",
-    lastUserExcerptChars: "-1", // should be ignored because < 0
     match: {
       strings: ["INTERNAL_ERROR; received from peer"],
       regexes: [{ pattern: "foo", flags: "i", label: "Foo" }],
@@ -59,9 +77,6 @@ test("normalizeConfig: clamps/normalizes inputs", () => {
   assert.equal(cfg.maxDelayMs, 250);
   assert.deepEqual(cfg.includeProviders, ["cli"]);
   assert.deepEqual(cfg.excludeProviders, ["openai"]);
-  assert.equal(cfg.marker, "[x]");
-  assert.equal(cfg.includeLastUserExcerpt, true);
-  assert.equal(cfg.lastUserExcerptChars, DEFAULT_CONFIG.lastUserExcerptChars);
   assert.deepEqual(cfg.match.strings, ["INTERNAL_ERROR; received from peer"]);
 });
 
@@ -79,20 +94,5 @@ test("shouldHandleProvider: respects include/exclude", () => {
   const cfg2 = normalizeConfig({ includeProviders: ["cli"] });
   assert.equal(shouldHandleProvider("cli", cfg2), true);
   assert.equal(shouldHandleProvider("openai", cfg2), false);
-});
-
-test("buildAutoContinueText: includes marker and optional excerpt", () => {
-  const text = buildAutoContinueText({
-    marker: "[better-opencode-retries]",
-    attempt: 1,
-    maxAttempts: 20,
-    label: "HTTP/2 stream internal error",
-    lastUserText: "Hello world",
-    includeLastUserExcerpt: true,
-    lastUserExcerptChars: 400,
-  });
-  assert.ok(text.startsWith("[better-opencode-retries]"));
-  assert.ok(text.includes("HTTP/2 stream internal error"));
-  assert.ok(text.includes("Hello world"));
 });
 

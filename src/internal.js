@@ -66,21 +66,6 @@ export const DEFAULT_CONFIG = Object.freeze({
   resetAfterMs: 2 * 60 * 1000,
 
   /**
-   * Prefix marker used for auto-retry messages (also used to ignore our own prompts).
-   */
-  marker: "[better-opencode-retries]",
-
-  /**
-   * Include an excerpt of the last *real* user prompt in the auto-continue prompt.
-   */
-  includeLastUserExcerpt: true,
-
-  /**
-   * Max characters of last user prompt excerpt.
-   */
-  lastUserExcerptChars: 400,
-
-  /**
    * Match configuration.
    */
   match: {
@@ -102,6 +87,36 @@ export const DEFAULT_CONFIG = Object.freeze({
      */
     regexes: [],
   },
+
+  /**
+   * If true, auto-retry on *any* session.error for handled providers,
+   * using structured error fields (status/code/name) to skip obvious
+   * non-transient failures.
+   *
+   * This avoids relying on message regexes, at the cost of potentially
+   * retrying more than you want if your exclusions are too permissive.
+   */
+  retryOnAnyError: false,
+
+  /**
+   * When retryOnAnyError=true, do NOT auto-retry if an HTTP-like status code
+   * is found and is in this list.
+   *
+   * Defaults are tuned to avoid infinite loops on auth/invalid-request errors.
+   */
+  excludeHttpStatus: [400, 401, 402, 403, 404, 405, 406, 407, 410, 411, 412, 413, 414, 415, 416],
+
+  /**
+   * When retryOnAnyError=true, do NOT auto-retry if an error code matches one of these
+   * strings (case-insensitive). Useful for provider-specific permanent failures.
+   */
+  excludeErrorCodes: [],
+
+  /**
+   * When retryOnAnyError=true, do NOT auto-retry if err.name matches one of these
+   * strings (case-insensitive).
+   */
+  excludeErrorNames: [],
 
   /**
    * Log extra details to opencode logs.
@@ -137,6 +152,16 @@ function toStringArray(value) {
   return out;
 }
 
+function toNumberArray(value) {
+  if (!Array.isArray(value)) return undefined;
+  const out = [];
+  for (const v of value) {
+    const n = toInt(v);
+    if (n !== undefined) out.push(n);
+  }
+  return out;
+}
+
 /**
  * Parse/normalize raw user config. Unknown keys are ignored.
  * @param {unknown} raw
@@ -145,6 +170,9 @@ export function normalizeConfig(raw) {
   const cfg = {
     ...DEFAULT_CONFIG,
     excludeProviders: [...DEFAULT_CONFIG.excludeProviders],
+    excludeHttpStatus: [...DEFAULT_CONFIG.excludeHttpStatus],
+    excludeErrorCodes: [...DEFAULT_CONFIG.excludeErrorCodes],
+    excludeErrorNames: [...DEFAULT_CONFIG.excludeErrorNames],
     match: {
       ...DEFAULT_CONFIG.match,
       strings: [...DEFAULT_CONFIG.match.strings],
@@ -175,16 +203,20 @@ export function normalizeConfig(raw) {
   const resetAfterMs = toInt(raw.resetAfterMs);
   if (resetAfterMs !== undefined && resetAfterMs >= 0) cfg.resetAfterMs = resetAfterMs;
 
-  if (typeof raw.marker === "string" && raw.marker.trim()) cfg.marker = raw.marker.trim();
-
-  const includeLastUserExcerpt = toBool(raw.includeLastUserExcerpt);
-  if (includeLastUserExcerpt !== undefined) cfg.includeLastUserExcerpt = includeLastUserExcerpt;
-
-  const lastUserExcerptChars = toInt(raw.lastUserExcerptChars);
-  if (lastUserExcerptChars !== undefined && lastUserExcerptChars >= 0) cfg.lastUserExcerptChars = lastUserExcerptChars;
-
   const debug = toBool(raw.debug);
   if (debug !== undefined) cfg.debug = debug;
+
+  const retryOnAnyError = toBool(raw.retryOnAnyError);
+  if (retryOnAnyError !== undefined) cfg.retryOnAnyError = retryOnAnyError;
+
+  const excludeHttpStatus = toNumberArray(raw.excludeHttpStatus);
+  if (excludeHttpStatus !== undefined) cfg.excludeHttpStatus = excludeHttpStatus;
+
+  const excludeErrorCodes = toStringArray(raw.excludeErrorCodes);
+  if (excludeErrorCodes !== undefined) cfg.excludeErrorCodes = excludeErrorCodes;
+
+  const excludeErrorNames = toStringArray(raw.excludeErrorNames);
+  if (excludeErrorNames !== undefined) cfg.excludeErrorNames = excludeErrorNames;
 
   if (isPlainObject(raw.match)) {
     const disableDefaults = toBool(raw.match.disableDefaults);
@@ -250,9 +282,92 @@ export function extractErrorMessage(err) {
   }
 }
 
+function firstString(...values) {
+  for (const v of values) {
+    if (typeof v === "string" && v.trim()) return v;
+  }
+  return "";
+}
+
+function firstInt(...values) {
+  for (const v of values) {
+    const n = toInt(v);
+    if (n !== undefined) return n;
+  }
+  return undefined;
+}
+
+/**
+ * Best-effort extraction of structured error fields.
+ * The shape varies depending on which layer threw it (provider SDK / fetch / OpenCode).
+ */
+export function extractErrorInfo(err) {
+  const message = extractErrorMessage(err);
+  const name = firstString(err?.name, err?.data?.name, err?.data?.error?.name);
+  const code = firstString(
+    err?.code,
+    err?.data?.code,
+    err?.data?.error?.code,
+    err?.cause?.code,
+    err?.cause?.data?.code
+  );
+  const status = firstInt(
+    err?.status,
+    err?.statusCode,
+    err?.data?.status,
+    err?.data?.statusCode,
+    err?.data?.error?.status,
+    err?.data?.error?.statusCode,
+    err?.cause?.status,
+    err?.cause?.statusCode
+  );
+  const type = firstString(err?.type, err?.data?.type, err?.data?.error?.type);
+  return { message, name, code, status, type, raw: err };
+}
+
 export function looksUserAborted(msg) {
   const s = String(msg ?? "").toLowerCase();
   return s.includes("aborterror") || (s.includes("aborted") && !s.includes("provider"));
+}
+
+function includesOneOfCaseInsensitive(value, needles) {
+  if (!value) return false;
+  const v = String(value).toLowerCase();
+  for (const n of needles ?? []) {
+    const s = String(n).trim().toLowerCase();
+    if (!s) continue;
+    if (v === s) return true;
+  }
+  return false;
+}
+
+/**
+ * Structured (non-regex) retry decision.
+ * Returns a label string if retryable, otherwise undefined.
+ */
+export function matchRetryableStructured(err, cfg) {
+  const info = extractErrorInfo(err);
+  const msg = info.message;
+  if (!msg) return undefined;
+  if (looksUserAborted(msg) || includesOneOfCaseInsensitive(info.name, ["AbortError"])) return undefined;
+
+  // Skip explicitly excluded name/code.
+  if (includesOneOfCaseInsensitive(info.code, cfg?.excludeErrorCodes)) return undefined;
+  if (includesOneOfCaseInsensitive(info.name, cfg?.excludeErrorNames)) return undefined;
+
+  // Skip excluded HTTP-like status codes (when present).
+  const status = info.status;
+  if (typeof status === "number" && Number.isFinite(status)) {
+    const excluded = Array.isArray(cfg?.excludeHttpStatus) ? cfg.excludeHttpStatus : DEFAULT_CONFIG.excludeHttpStatus;
+    if (excluded.includes(status)) return undefined;
+    return `HTTP status ${status}`;
+  }
+
+  // If we have a string error code, classify it.
+  if (info.code) return `Error code ${info.code}`;
+
+  // Fall back to "Any error" (still non-regex; uses the fact that a session.error happened).
+  return "Any error";
 }
 
 export function compileMatchers(cfg) {
@@ -324,31 +439,5 @@ export function shouldHandleProvider(providerId, cfg) {
   }
 
   return true;
-}
-
-export function buildAutoContinueText(input) {
-  const {
-    marker,
-    attempt,
-    maxAttempts,
-    label,
-    lastUserText,
-    includeLastUserExcerpt,
-    lastUserExcerptChars,
-  } = input;
-
-  const excerpt =
-    includeLastUserExcerpt && lastUserText
-      ? lastUserText.slice(0, Math.max(0, lastUserExcerptChars ?? 0))
-      : "";
-
-  return [
-    `${marker} [auto-retry ${attempt}/${maxAttempts}] The previous response was interrupted by a transient error (${label}).`,
-    "Continue from where you left off.",
-    "Do not repeat content that was already sent; resume at the next token.",
-    excerpt ? `\nContext (last user prompt excerpt):\n${excerpt}` : "",
-  ]
-    .filter(Boolean)
-    .join("\n");
 }
 

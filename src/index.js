@@ -1,12 +1,12 @@
 import {
   DEFAULT_CONFIG,
-  normalizeConfig,
   mergeConfig,
   computeDelayMs,
   extractErrorMessage,
   matchRetryable,
+  matchRetryableStructured,
+  extractErrorInfo,
   shouldHandleProvider,
-  buildAutoContinueText,
 } from "./internal.js";
 
 const PATCH_FLAG = Symbol.for("better-opencode-retries.plugin.loaded.v1");
@@ -44,7 +44,6 @@ export const BetterOpencodeRetries = async (ctx = {}) => {
   if (globalThis[PATCH_FLAG]) return {};
   globalThis[PATCH_FLAG] = true;
 
-  const lastUser = new Map(); // sessionID -> { agent, model, variant, text }
   const retryState = new Map(); // sessionID -> { attempts, lastAt, pending }
   const providerConfig = new Map(); // providerID -> config
 
@@ -73,72 +72,7 @@ export const BetterOpencodeRetries = async (ctx = {}) => {
     return cfg;
   };
 
-  const getMarkersForProvider = (providerId) => {
-    const cfg = providerId ? getConfigForProvider(providerId) : globalCfg;
-    const markers = new Set([
-      DEFAULT_CONFIG.marker,
-      globalCfg.marker,
-      cfg?.marker,
-      // Back-compat with earlier prototype plugin marker
-      "[auto-retry",
-    ]);
-    return Array.from(markers).filter((m) => typeof m === "string" && m.trim().length > 0);
-  };
-
-  const isAutoRetryPrompt = (text, providerId) => {
-    if (!text) return false;
-    const markers = getMarkersForProvider(providerId);
-    return markers.some((m) => text.startsWith(m));
-  };
-
-  const getSessionMessages = async (sessionID, limit = 50) => {
-    try {
-      const res = await ctx?.client?.session?.messages?.({
-        path: { id: sessionID },
-        query: { limit },
-      });
-      const data = res && typeof res === "object" && "data" in res ? res.data : res;
-      return Array.isArray(data) ? data : undefined;
-    } catch {
-      return undefined;
-    }
-  };
-
-  const hydrateLastUserFromServer = async (sessionID) => {
-    const messages = await getSessionMessages(sessionID, 50);
-    if (!messages) return undefined;
-
-    for (let i = messages.length - 1; i >= 0; i--) {
-      const item = messages[i];
-      const info = item?.info;
-      if (!info || info.role !== "user") continue;
-
-      const providerId = info?.model?.providerID;
-      const parts = Array.isArray(item?.parts) ? item.parts : [];
-      const text = parts
-        .filter((p) => p && p.type === "text" && typeof p.text === "string")
-        .map((p) => p.text)
-        .join("\n")
-        .trim();
-
-      // Don't let our own auto-retry prompts overwrite last-user state.
-      if (isAutoRetryPrompt(text, providerId)) continue;
-
-      const existing = lastUser.get(sessionID);
-      lastUser.set(sessionID, {
-        agent: info.agent ?? existing?.agent,
-        model: info.model ?? existing?.model,
-        variant: existing?.variant,
-        text: text ?? existing?.text ?? "",
-      });
-
-      return lastUser.get(sessionID);
-    }
-
-    return undefined;
-  };
-
-  const scheduleContinue = async ({ sessionID, providerID, label, message }) => {
+  const scheduleRetry = async ({ sessionID, providerID, label, message }) => {
     const cfg = getConfigForProvider(providerID);
     if (!shouldHandleProvider(providerID, cfg)) return;
 
@@ -169,7 +103,7 @@ export const BetterOpencodeRetries = async (ctx = {}) => {
     retryState.set(sessionID, { attempts: attempt, lastAt: now, pending: true });
 
     if (cfg.debug) {
-      await log("warn", "scheduling auto-continue after transient error", {
+      await log("warn", "scheduling auto-retry after error", {
         sessionID,
         providerID,
         attempt,
@@ -178,37 +112,21 @@ export const BetterOpencodeRetries = async (ctx = {}) => {
       });
     }
 
-    const last = lastUser.get(sessionID);
-    const marker = cfg.marker || DEFAULT_CONFIG.marker;
-
     setTimeout(() => {
       void (async () => {
         try {
-          const promptText = buildAutoContinueText({
-            marker,
-            attempt,
-            maxAttempts: cfg.maxAttempts,
-            label,
-            lastUserText: last?.text ?? "",
-            includeLastUserExcerpt: cfg.includeLastUserExcerpt,
-            lastUserExcerptChars: cfg.lastUserExcerptChars,
-          });
-
           await ctx?.client?.session?.prompt?.({
             path: { id: sessionID },
             body: {
-              agent: last?.agent,
-              model: last?.model,
-              variant: last?.variant,
-              parts: [{ type: "text", text: promptText }],
+              parts: [{ type: "text", text: "." }],
             },
           });
 
           if (cfg.debug) {
-            await log("info", "auto-continue sent", { sessionID, providerID, attempt, label });
+            await log("info", "auto-retry prompt sent", { sessionID, providerID, attempt, label });
           }
         } catch (err) {
-          await log("error", "auto-continue failed", {
+          await log("error", "auto-retry prompt failed", {
             sessionID,
             providerID,
             attempt,
@@ -267,71 +185,50 @@ export const BetterOpencodeRetries = async (ctx = {}) => {
       }
     },
 
-    // Track last user prompt context for better continuation prompts.
-    "chat.message": async (input, output) => {
-      try {
-        if (!input?.sessionID) return;
-        const info = output?.message;
-        const providerId = info?.model?.providerID;
-
-        const parts = Array.isArray(output?.parts) ? output.parts : [];
-        const text = parts
-          .filter((p) => p && p.type === "text" && typeof p.text === "string")
-          .map((p) => p.text)
-          .join("\n")
-          .trim();
-
-        // Ignore our own auto-retry prompts.
-        if (isAutoRetryPrompt(text, providerId)) return;
-
-        lastUser.set(input.sessionID, {
-          // Prefer the stored message info because it always includes a resolved model.
-          agent: info?.agent ?? input.agent,
-          model: info?.model ?? input.model,
-          variant: input.variant,
-          text: text ?? "",
-        });
-      } catch {}
-    },
-
     // React to transient stream/network errors and recover.
     event: async ({ event }) => {
       try {
-        if (!event || event.type !== "session.error") return;
+        if (!event) return;
 
-        const sessionID = event.properties?.sessionID;
-        if (!sessionID) return;
+        // Prefer message.updated because assistant errors include providerID/modelID,
+        // which lets us pick the correct provider config without relying on last-user state.
+        if (event.type === "message.updated") {
+          const info = event.properties?.info;
+          const sessionID = info?.sessionID;
+          if (!sessionID || !info) return;
 
-        const msg = extractErrorMessage(event.properties?.error);
-        if (!msg) return;
+          if (info.role === "assistant") {
+            const errObj = info.error;
+            const providerID = typeof info.providerID === "string" ? info.providerID : undefined;
+            if (!errObj || !providerID) return;
 
-        // Best-effort providerID from last user message.
-        let last = lastUser.get(sessionID);
-        let providerID = last?.model?.providerID;
+            const msg = extractErrorMessage(errObj);
+            const cfg = getConfigForProvider(providerID);
+            if (!shouldHandleProvider(providerID, cfg)) return;
 
-        // If we don't have last-user context (or it lacks model info), fetch it from the server.
-        if (!providerID) {
-          last = (await hydrateLastUserFromServer(sessionID)) ?? last;
-          providerID = last?.model?.providerID;
+            const label = cfg.retryOnAnyError ? matchRetryableStructured(errObj, cfg) : matchRetryable(msg, cfg);
+            if (!label) return;
+
+            if (cfg.debug) {
+              const e = extractErrorInfo(errObj);
+              await log("warn", "detected retryable error (message.updated)", {
+                sessionID,
+                providerID,
+                label,
+                message: msg,
+                error: e,
+              });
+            }
+
+            await scheduleRetry({ sessionID, providerID, label, message: msg });
+          }
+
+          return;
         }
-        if (!providerID) return;
 
-        const cfg = getConfigForProvider(providerID);
-        if (!shouldHandleProvider(providerID, cfg)) return;
-
-        const label = matchRetryable(msg, cfg);
-        if (!label) return;
-
-        if (cfg.debug) {
-          await log("warn", "detected retryable error", {
-            sessionID,
-            providerID,
-            label,
-            message: msg,
-          });
-        }
-
-        await scheduleContinue({ sessionID, providerID, label, message: msg });
+        // Keep behavior minimal: we only auto-retry when we can attribute the error
+        // to an assistant message (which includes provider/model context).
+        return;
       } catch {}
     },
   };

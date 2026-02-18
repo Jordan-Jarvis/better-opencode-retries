@@ -4,14 +4,18 @@ An **OpenCode plugin** that makes “mid-stream” provider failures less painfu
 
 When OpenCode gets a transient streaming/network error (for example:
 `stream error: stream ID 705; INTERNAL_ERROR; received from peer`), OpenCode may stop the session.
-This plugin automatically **sends a follow-up “continue from where you left off” prompt** with
-exponential backoff, so your workflow keeps going without manual restarts.
+This plugin automatically **sends a minimal retry prompt (`.`)** with exponential backoff, so your workflow
+keeps going without manual restarts.
 
 ### How it works
 
-- Listens for `session.error` events.
-- Detects retryable errors using a configurable matcher set (defaults include the common HTTP/2 `INTERNAL_ERROR; received from peer`).
-- After a backoff, sends an automatic continuation prompt to the same session using the last known agent/model/variant.
+- Listens for error signals via:
+  - `message.updated` (preferred; includes provider/model context on assistant errors), and
+  - `session.error` (fallback, only when provider context is available).
+- Detects retryable errors either via:
+  - a **structured** mode (`retryOnAnyError=true`) using `status` / `code` / `name` (with exclusions), or
+  - a configurable matcher set (defaults include the common HTTP/2 `INTERNAL_ERROR; received from peer`).
+- After a backoff, sends a single `.` message to the same session (keeps it as non-intrusive as possible).
 
 ### Install (local file plugin)
 
@@ -50,14 +54,18 @@ Example (only apply to your `cli` provider):
           "includeProviders": ["cli"],
           "excludeProviders": [],
 
+          // If true, retry on any provider/session error, using structured fields
+          // (HTTP status / code / name) and exclusions rather than message regexes.
+          "retryOnAnyError": false,
+          // Note: 422 is retried by default in structured mode. Add 422 here if you want to exclude it.
+          "excludeHttpStatus": [400, 401, 403, 404],
+          "excludeErrorCodes": [],
+          "excludeErrorNames": [],
+
           "maxAttempts": 20,
           "baseDelayMs": 2000,
           "maxDelayMs": 30000,
           "resetAfterMs": 120000,
-
-          "marker": "[better-opencode-retries]",
-          "includeLastUserExcerpt": true,
-          "lastUserExcerptChars": 400,
 
           "match": {
             "disableDefaults": false,
@@ -121,6 +129,6 @@ npm test
 
 - This does **not** prevent upstream HTTP/2 resets or provider gateway interruptions.
   It only makes recovery automatic.
-- Recovery is implemented by sending a new “continue” user message (prefixed with the configured `marker`).
+- Recovery is implemented by sending a new minimal user message: `.`.
   That message will be visible in the session history.
 
